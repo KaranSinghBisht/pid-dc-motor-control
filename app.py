@@ -1,50 +1,70 @@
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
-from simple_pid import PID
-from motor import DCMotorParams, DCMotorSim
+from motor import DCMotorParams, DCMotorSim   # uses your motor.py
 
+# =======================
+# PAGE CONFIG
+# =======================
 st.set_page_config(page_title="DC Motor PID", layout="wide")
 
-# ---- session defaults ----
+
+# =======================
+# SESSION DEFAULTS
+# =======================
 def _ss_set_default(key, value):
     if key not in st.session_state:
         st.session_state[key] = value
 
+
 _ss_set_default("page", "Simulation")
+
+# default PID (balanced-ish)
+_ss_set_default("Kp", 0.8)
+_ss_set_default("Ki", 1.2)
+_ss_set_default("Kd", 0.02)
+
 _ss_set_default("setpoint_rpm", 1200)
-_ss_set_default("Kp", 0.5)
-_ss_set_default("Ki", 20.0)
-_ss_set_default("Kd", 0.0)
-_ss_set_default("sim_time", 5.0)
+_ss_set_default("sim_time", 6.0)
 _ss_set_default("dt", 0.002)
 _ss_set_default("volts_limit", 12)
-_ss_set_default("J", 0.01)
-_ss_set_default("b", 0.1)
-_ss_set_default("Kt", 0.01)
-_ss_set_default("Ke", 0.01)
-_ss_set_default("R", 1.0)
-_ss_set_default("L", 0.5)
 
-# ---- helpers ----
-def performance_metrics(t, y, target, tol=0.02):
+# =======================
+# FIXED MOTOR PARAMETERS
+# (chosen so 12V ≈ 1200 RPM at steady state)
+# =======================
+BASE_PARAMS = DCMotorParams(
+    J=0.01,
+    b=0.00228,
+    Kt=0.05,
+    Ke=0.05,
+    R=1.0,
+    L=0.01,
+)
+
+
+# =======================
+# HELPERS
+# =======================
+def performance_metrics(t, y, target, tol=0.02, window_sec=0.1):
     """
-    Rise time: 10→90% of step magnitude.
-    Overshoot: % above/below target (for step responses).
-    Settling time: last time the response leaves ±tol*|target| band.
-                   If it never stays in-band, returns NaN.
+    - Rise time: 10→90% of step magnitude
+    - Overshoot: % above target (for positive step)
+    - Settling time: earliest time after which the response
+      stays within ±tol*|target| for the rest of the simulation.
     """
     y = np.asarray(y, dtype=float)
     target = float(target)
-
-    if len(t) < 2:
+    n = len(t)
+    if n < 2:
         return np.nan, 0.0, np.nan
 
-    # ----- Rise time (10→90% of step magnitude) -----
+    dt = float(t[1] - t[0])
+
+    # ----- Rise time -----
     y0 = float(y[0])
     step = target - y0
     rise = np.nan
-
     if abs(step) > 1e-9:
         y10 = y0 + 0.10 * step
         y90 = y0 + 0.90 * step
@@ -62,69 +82,86 @@ def performance_metrics(t, y, target, tol=0.02):
             if t90 >= t10:
                 rise = t90 - t10
 
-    # ----- Overshoot -----
+    # ----- Overshoot (positive step only) -----
     overshoot = 0.0
-    if abs(target) > 1e-9 and abs(step) > 1e-9:
-        if step > 0:
-            # positive step: look for max above target
-            overshoot = max((np.max(y) - target) / abs(target) * 100.0, 0.0)
-        else:
-            # negative step: look for min below target
-            overshoot = max((target - np.min(y)) / abs(target) * 100.0, 0.0)
+    if step > 0 and abs(target) > 1e-9:
+        overshoot = max((np.max(y) - target) / abs(target) * 100.0, 0.0)
 
-    # ----- Settling time (±tol band) -----
-    # small absolute floor to avoid crazy band near 0
+    # ----- Settling time: stay in band for rest of sim -----
     eps = max(tol * abs(target), 1e-3)
-
     outside = np.where(np.abs(y - target) > eps)[0]
 
     if len(outside) == 0:
-        # always within band
         settle = t[0]
     else:
         last_out = outside[-1]
-        if last_out == len(y) - 1:
-            # still outside at end → did not settle in given sim_time
-            settle = np.nan
+        if last_out < n - 1:
+            # from next sample onward it is within band
+            if np.all(np.abs(y[last_out + 1:] - target) <= eps):
+                settle = t[last_out + 1]
+            else:
+                settle = np.nan
         else:
-            # first time after last excursion
-            settle = t[last_out + 1]
+            settle = np.nan
 
     return rise, overshoot, settle
 
 
-def simulate(params, pid_gains, setpoint_rad, dt, sim_time, volts_limit):
-    plant = DCMotorSim(params, dt=dt)
+def simulate(pid_gains, setpoint_rad, dt, sim_time, volts_limit):
+    """
+    Closed-loop simulation with our own discrete PID.
+    This avoids real-time issues from simple_pid.
+    """
+    plant = DCMotorSim(BASE_PARAMS, dt=dt)
     plant.reset(0.0, 0.0)
 
     Kp, Ki, Kd = pid_gains
-    pid = PID(Kp, Ki, Kd, setpoint=setpoint_rad)
-    pid.output_limits = (-volts_limit, volts_limit)
 
     steps = int(sim_time / dt)
-    t = np.linspace(0, sim_time, steps, endpoint=False)
+    t = np.linspace(0.0, sim_time, steps, endpoint=False)
 
     w_hist = np.zeros(steps)
     u_hist = np.zeros(steps)
     sp_hist = np.full(steps, setpoint_rad)
+    e_hist = np.zeros(steps)
+
+    integral = 0.0
+    e_prev = setpoint_rad - plant.w
 
     for k in range(steps):
-        u = pid(plant.w)          # control based on current speed
-        w_next, _ = plant.step(u) # motor dynamics
+        e = setpoint_rad - plant.w
+        integral += e * dt
+        derivative = (e - e_prev) / dt if k > 0 else 0.0
+
+        # raw PID
+        u = Kp * e + Ki * integral + Kd * derivative
+
+        # saturation + simple anti-windup:
+        if u > volts_limit:
+            u = volts_limit
+            # prevent windup when pushing against upper limit
+            if e > 0:
+                integral -= e * dt
+        elif u < -volts_limit:
+            u = -volts_limit
+            if e < 0:
+                integral -= e * dt
+
+        w_next, _ = plant.step(u)
+
         w_hist[k] = w_next
         u_hist[k] = u
+        sp_hist[k] = setpoint_rad
+        e_hist[k] = e
 
-    return t, w_hist, u_hist, sp_hist
+        plant.w = w_next
+        e_prev = e
+
+    return t, w_hist, u_hist, sp_hist, e_hist
 
 
 def radps_to_rpm(x):
-    return (x * 60.0) / (2 * np.pi)
-
-
-def fmt_time(x):
-    if x is None or np.isnan(x):
-        return "Not settled"
-    return f"{x:.3f} s"
+    return (x * 60.0) / (2.0 * np.pi)
 
 
 def fmt_rise(x):
@@ -133,118 +170,122 @@ def fmt_rise(x):
     return f"{x:.3f} s"
 
 
-# ---- presets ----
+def fmt_settle(x):
+    if x is None or np.isnan(x):
+        return "Not settled"
+    return f"{x:.3f} s"
+
+
+# =======================
+# PID PRESETS (ONLY GAINS)
+# =======================
 def apply_preset(name: str):
-    if name == "Small Hobby Motor (balanced)":
-        st.session_state.update(dict(
-            setpoint_rpm=1200, volts_limit=12,
-            J=0.0001, b=0.001, Kt=0.05, Ke=0.05, R=1.0, L=0.01,
-            Kp=0.30, Ki=3.0, Kd=0.001, sim_time=6.0, dt=0.002
-        ))
-    elif name == "Fast Response (more overshoot)":
-        st.session_state.update(dict(
-            setpoint_rpm=1500, volts_limit=24,
-            J=0.0001, b=0.001, Kt=0.05, Ke=0.05, R=1.0, L=0.01,
-            Kp=0.80, Ki=8.0, Kd=0.0, sim_time=6.0, dt=0.002
-        ))
-    elif name == "Conservative/Robust (low overshoot)":
-        st.session_state.update(dict(
-            setpoint_rpm=1200, volts_limit=12,
-            J=0.0002, b=0.002, Kt=0.04, Ke=0.04, R=1.2, L=0.02,
-            Kp=0.20, Ki=1.5, Kd=0.003, sim_time=8.0, dt=0.002
-        ))
+    """
+    Only adjusts Kp, Ki, Kd.
+    Plant is fixed so differences in response are purely due to tuning.
+    """
+    if name == "Balanced":
+        st.session_state.update(dict(Kp=0.8, Ki=1.2, Kd=0.02))
+    elif name == "Fast (Overshoot)":
+        st.session_state.update(dict(Kp=1.6, Ki=2.5, Kd=0.01))
+    elif name == "Slow (No Overshoot)":
+        st.session_state.update(dict(Kp=0.3, Ki=0.3, Kd=0.08))
 
 
-# ---- sidebar page selector ----
+# =======================
+# SIDEBAR PAGE SELECTOR
+# =======================
 with st.sidebar:
     st.selectbox("Page", ["Simulation", "Report"], key="page")
 
 st.title("DC Motor Speed Control using PID (Python)")
+
 
 # =======================
 # SIMULATION PAGE
 # =======================
 if st.session_state.page == "Simulation":
     with st.sidebar:
-        st.header("Quick Presets")
+        # --- Presets ---
+        st.header("PID Presets")
         c1, c2, c3 = st.columns(3)
-        if c1.button("Hobby Motor"):
-            apply_preset("Small Hobby Motor (balanced)")
+        if c1.button("Balanced"):
+            apply_preset("Balanced")
         if c2.button("Fast"):
-            apply_preset("Fast Response (more overshoot)")
-        if c3.button("Conservative"):
-            apply_preset("Conservative/Robust (low overshoot)")
+            apply_preset("Fast (Overshoot)")
+        if c3.button("Slow"):
+            apply_preset("Slow (No Overshoot)")
 
-        st.header("PID & Plant Settings")
+        # --- Setpoint & gains ---
+        st.header("Setpoint & PID")
+
         setpoint_rpm = st.slider(
-            "Setpoint (RPM)", 0, 3000,
-            st.session_state.setpoint_rpm, 50,
-            key="setpoint_rpm"
+            "Setpoint (RPM)",
+            min_value=0,
+            max_value=3000,
+            value=int(st.session_state.setpoint_rpm),
+            step=50,
+            key="setpoint_rpm",
         )
-        setpoint_rad = (setpoint_rpm * 2 * np.pi) / 60.0
+        setpoint_rad = (setpoint_rpm * 2.0 * np.pi) / 60.0
 
-        st.subheader("PID gains")
-        Kp = st.number_input("Kp",
-                             value=float(st.session_state.Kp),
-                             step=0.05, format="%.3f", key="Kp")
-        Ki = st.number_input("Ki",
-                             value=float(st.session_state.Ki),
-                             step=0.5, format="%.3f", key="Ki")
-        Kd = st.number_input("Kd",
-                             value=float(st.session_state.Kd),
-                             step=0.001, format="%.3f", key="Kd")
+        st.subheader("PID Gains")
+        Kp = st.number_input(
+            "Kp", value=float(st.session_state.Kp),
+            step=0.1, format="%.3f", key="Kp"
+        )
+        Ki = st.number_input(
+            "Ki", value=float(st.session_state.Ki),
+            step=0.1, format="%.3f", key="Ki"
+        )
+        Kd = st.number_input(
+            "Kd", value=float(st.session_state.Kd),
+            step=0.005, format="%.3f", key="Kd"
+        )
 
-        st.subheader("Simulation options")
-        sim_time = st.slider("Simulation time (s)",
-                             1.0, 12.0,
-                             float(st.session_state.sim_time),
-                             0.5, key="sim_time")
-        dt = st.select_slider("Time step dt (s)",
-                              options=[0.001, 0.002, 0.005, 0.01],
-                              value=float(st.session_state.dt),
-                              key="dt")
-        volts_limit = st.slider("Voltage limit (±V)",
-                                1, 48,
-                                int(st.session_state.volts_limit),
-                                1, key="volts_limit")
+        # --- Simulation options ---
+        st.header("Simulation")
+        sim_time = st.slider(
+            "Simulation time (s)",
+            min_value=1.0,
+            max_value=20.0,
+            value=float(st.session_state.sim_time),
+            step=0.5,
+            key="sim_time",
+        )
+        dt = st.select_slider(
+            "Time step dt (s)",
+            options=[0.001, 0.002, 0.005, 0.01],
+            value=float(st.session_state.dt),
+            key="dt",
+        )
+        volts_limit = st.slider(
+            "Voltage limit (±V)",
+            min_value=2,
+            max_value=24,
+            value=int(st.session_state.volts_limit),
+            step=1,
+            key="volts_limit",
+        )
 
-        st.subheader("Motor Params")
-        J = st.number_input("J (kg·m²)",
-                            value=float(st.session_state.J),
-                            step=0.0001, format="%.5f", key="J")
-        b = st.number_input("b (N·m·s)",
-                            value=float(st.session_state.b),
-                            step=0.0005, format="%.5f", key="b")
-        Kt = st.number_input("Kt (N·m/A)",
-                             value=float(st.session_state.Kt),
-                             step=0.001, format="%.5f", key="Kt")
-        Ke = st.number_input("Ke (V·s/rad)",
-                             value=float(st.session_state.Ke),
-                             step=0.001, format="%.5f", key="Ke")
-        R = st.number_input("R (Ω)",
-                            value=float(st.session_state.R),
-                            step=0.1, format="%.3f", key="R")
-        L = st.number_input("L (H)",
-                            value=float(st.session_state.L),
-                            step=0.005, format="%.3f", key="L")
-
-        run = st.button("Run Simulation",
-                        type="primary",
-                        use_container_width=True)
+        run = st.button(
+            "Run Simulation",
+            type="primary",
+            use_container_width=True,
+        )
 
     if run:
-        params = DCMotorParams(J=J, b=b, Kt=Kt, Ke=Ke, R=R, L=L)
-        t, w_hist, u_hist, sp_hist = simulate(
-            params=params,
+        t, w_hist, u_hist, sp_hist, e_hist = simulate(
             pid_gains=(Kp, Ki, Kd),
             setpoint_rad=setpoint_rad,
             dt=dt,
             sim_time=sim_time,
-            volts_limit=volts_limit
+            volts_limit=volts_limit,
         )
 
         w_rpm = radps_to_rpm(w_hist)
         sp_rpm = radps_to_rpm(sp_hist)
+        e_rpm = radps_to_rpm(e_hist)
 
         rise, overshoot, settle = performance_metrics(
             t, w_hist, setpoint_rad, tol=0.02
@@ -252,59 +293,77 @@ if st.session_state.page == "Simulation":
 
         col1, col2 = st.columns([2, 1], gap="large")
 
+        # ---- plots ----
         with col1:
-            # Speed response
+            # Speed vs setpoint
             fig = go.Figure()
             fig.add_trace(go.Scatter(
                 x=t, y=w_rpm,
                 mode="lines",
-                name="Speed (RPM)"
+                name="Speed (RPM)",
             ))
             fig.add_trace(go.Scatter(
                 x=t, y=sp_rpm,
                 mode="lines",
                 name="Setpoint (RPM)",
-                line=dict(dash="dash")
+                line=dict(dash="dash"),
             ))
             fig.update_layout(
                 title="Motor Speed Response",
                 xaxis_title="Time (s)",
                 yaxis_title="RPM",
-                height=450
+                height=380,
             )
             st.plotly_chart(fig, use_container_width=True)
+
+            # Error plot (in RPM)
+            fig_e = go.Figure()
+            fig_e.add_trace(go.Scatter(
+                x=t, y=e_rpm,
+                mode="lines",
+                name="Error (RPM)",
+            ))
+            fig_e.update_layout(
+                title="Speed Error (Setpoint - Actual)",
+                xaxis_title="Time (s)",
+                yaxis_title="Error (RPM)",
+                height=220,
+            )
+            st.plotly_chart(fig_e, use_container_width=True)
 
             # Control signal
             fig_u = go.Figure()
             fig_u.add_trace(go.Scatter(
                 x=t, y=u_hist,
                 mode="lines",
-                name="Control Voltage (V)"
+                name="Control Voltage (V)",
             ))
             fig_u.update_layout(
-                title="Control Signal",
+                title="Control Signal (Armature Voltage)",
                 xaxis_title="Time (s)",
                 yaxis_title="Voltage (V)",
-                height=300
+                height=220,
             )
             st.plotly_chart(fig_u, use_container_width=True)
 
+        # ---- metrics ----
         with col2:
             st.subheader("Performance")
             st.metric("Rise time (10→90%)", fmt_rise(rise))
             st.metric("Overshoot", f"{overshoot:.2f} %")
-            st.metric("Settling time (±2%)", fmt_time(settle))
+            st.metric("Settling time (±2%)", fmt_settle(settle))
 
-            st.subheader("Notes")
+            st.subheader("How to interpret")
             st.write(
-                "- Increase **Kp** → faster rise (watch overshoot)\n"
-                "- Increase **Ki** → removes steady-state error (watch windup)\n"
-                "- Increase **Kd** → damps overshoot/noise"
+                "- **Kp ↑** → faster rise, usually more overshoot.\n"
+                "- **Ki ↑** → removes steady-state error; too large → overshoot & slow settling (integral windup).\n"
+                "- **Kd ↑** → adds damping; reduces overshoot but too high → sluggish.\n"
+                "- **Voltage limit** models actuator saturation; if too low, you may get slow response or steady-state error."
             )
     else:
         st.info(
-            "Set parameters in the sidebar, choose a preset if you like, "
-            "then click **Run Simulation**."
+            "Pick PID gains (or a preset) and click **Run Simulation** to see how "
+            "speed, error and performance indices change."
         )
 
 # =======================
@@ -326,51 +385,54 @@ else:
 
     st.markdown("### Aim")
     st.write(
-        "Design and evaluate a PID controller for an armature-controlled DC motor to track a desired "
-        "speed (RPM) with minimal steady-state error, acceptable rise time, and bounded overshoot, "
-        "demonstrated via a Python/Streamlit dashboard."
+        "To design and study a PID controller for an armature-controlled DC motor so that "
+        "the motor speed follows a desired setpoint with acceptable rise time, low overshoot, "
+        "and negligible steady-state error."
     )
 
     st.markdown("### Theory")
     st.latex(
-        r"""\dot{\omega} = \frac{K_t\,i - b\,\omega}{J}, \qquad
-            \dot{i} = \frac{V - R\,i - K_e\,\omega}{L}"""
+        r"""\dot{\omega} = \frac{K_t i - b\omega}{J},
+            \qquad
+            \dot{i} = \frac{V - Ri - K_e\omega}{L}"""
     )
     st.write(
-        "where $\\omega$ is angular speed, $i$ is armature current, and $V$ is applied voltage."
+        "where $\\omega$ is angular speed, $i$ is armature current, and $V$ is the applied armature voltage."
     )
     st.latex(
-        r"""\left.\frac{\omega}{V}\right|_{ss} \approx
-            \frac{K_t}{R\,b + K_t K_e}"""
+        r"""\left.\frac{\omega}{V}\right|_{ss}
+            \approx
+            \frac{K_t}{Rb + K_t K_e}"""
     )
     st.write(
-        "A PID controller computes the control voltage"
+        "A PID controller uses the error $e(t) = \\omega_{ref}(t) - \\omega(t)$ to generate the control voltage:"
     )
     st.latex(
-        r"""V(t) = K_p\,e(t) + K_i \int_0^t e(\tau)\,d\tau +
-        K_d\,\frac{de(t)}{dt}, \quad e(t)=\omega_{\mathrm{ref}}-\omega(t)"""
-    )
-    st.write(
-        "Tuning trades off rise time, overshoot, and noise sensitivity."
+        r"""V(t) = K_p e(t)
+        + K_i \int_0^t e(\tau)\,d\tau
+        + K_d \frac{de(t)}{dt}."""
     )
 
     st.markdown("### Method")
     st.write(
-        "1. Implemented a discrete-time simulator of the DC motor in Python.\n"
-        "2. Closed the loop with a PID controller (`simple-pid`).\n"
-        "3. Built an interactive Streamlit app to vary motor parameters and PID gains.\n"
-        "4. Reported key time-domain metrics: rise time (10→90%), percent overshoot, and 2% settling time."
+        "1. Modelled the DC motor using its differential equations.\n"
+        "2. Implemented a discrete-time simulator (`DCMotorSim`).\n"
+        "3. Implemented a digital PID controller in Python using the error.\n"
+        "4. Built a Streamlit UI to vary $K_p, K_i, K_d$, setpoint, and voltage limit.\n"
+        "5. Computed rise time, percent overshoot, and 2% settling time from the simulated response."
     )
 
-    st.markdown("### Results (Representative)")
+    st.markdown("### Observations")
     st.write(
-        "Using a light ‘small hobby motor’ configuration (preset), the controller tracks a 1200 RPM step "
-        "with moderate rise time and low overshoot at gains around Kp≈0.30, Ki≈3.0, Kd≈0.001 under a 12 V limit. "
-        "A faster preset reduces rise time but increases overshoot; a conservative preset improves damping at the cost of speed."
+        "- Higher $K_p$ reduces rise time but increases overshoot (underdamped).\n"
+        "- Higher $K_i$ eliminates steady-state error but can cause overshoot and longer settling.\n"
+        "- Higher $K_d$ adds damping, reducing overshoot and improving settling.\n"
+        "These trends match standard control systems theory."
     )
 
     st.markdown("### Conclusion")
     st.write(
-        "The PID controller meets the speed-tracking objective over a range of motor parameters. "
-        "Interactive tuning highlights the trade-offs among rise time, overshoot, and steady-state error."
+        "The project demonstrates a complete closed-loop speed control of a DC motor using PID. "
+        "The interactive tool clearly links theoretical concepts (error, rise time, overshoot, "
+        "settling time, steady-state error) with the simulated response."
     )
